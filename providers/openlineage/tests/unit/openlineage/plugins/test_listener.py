@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
+import os
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
@@ -30,6 +33,7 @@ from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import psutil
 import pytest
 from openlineage.client import OpenLineageClient
 from openlineage.client.transport import ConsoleTransport
@@ -187,8 +191,51 @@ class TestProcessAdapterReuse:
         mock_get_adapter.return_value.fail_task.assert_called_once_with()
 
 
+def _own_pool_then_die(conn):
+    """Create a listener-style pool, report its worker pid, then exit without shutting the pool down."""
+    from airflow.providers.openlineage.plugins.listener import _exit_with_parent
+
+    pool = ProcessPoolExecutor(
+        max_workers=1, initializer=_exit_with_parent, mp_context=multiprocessing.get_context("forkserver")
+    )
+    conn.send(pool.submit(os.getpid).result(timeout=60))
+    os._exit(0)
+
+
+def _process_gone(pid: int) -> bool:
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
 class TestExecutorInitializer:
     """Tests for _executor_initializer function."""
+
+    def test_pool_worker_exits_when_pool_owner_dies(self):
+        """
+        A pool worker must not outlive the process that owns the pool.
+
+        Regression test: API server workers never call ``before_stopping``, so when one was refreshed
+        or killed its idle pool worker blocked on the call queue forever and leaked a full process.
+        """
+        receiver, sender = multiprocessing.Pipe(duplex=False)
+        owner = multiprocessing.get_context("spawn").Process(target=_own_pool_then_die, args=(sender,))
+        owner.start()
+        worker_pid = None
+        try:
+            assert receiver.poll(120)
+            worker_pid = receiver.recv()
+            owner.join(timeout=60)
+
+            deadline = time.monotonic() + 30
+            while not _process_gone(worker_pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert _process_gone(worker_pid)
+        finally:
+            owner.kill()
+            if worker_pid is not None and not _process_gone(worker_pid):
+                os.kill(worker_pid, 9)
 
     @patch("airflow.settings.configure_orm")
     def test_executor_initializer_calls_configure_orm(self, mock_configure_orm):
@@ -1078,7 +1125,8 @@ class TestOpenLineageListenerAirflow2:
         # mock ProcessPoolExecutor class
         with conf_vars({("openlineage", "dag_state_change_process_pool_size"): max_workers}):
             listener.on_dag_run_running(mock.MagicMock(), None)
-        mock_executor.assert_called_once_with(max_workers=expected, initializer=mock.ANY)
+        mock_executor.assert_called_once_with(max_workers=expected, initializer=mock.ANY, mp_context=mock.ANY)
+        assert mock_executor.call_args.kwargs["mp_context"].get_start_method() == "forkserver"
         mock_executor.return_value.submit.assert_called_once()
 
     @pytest.mark.db_test
@@ -2796,7 +2844,8 @@ class TestOpenLineageListenerAirflow3:
         # mock ProcessPoolExecutor class
         with conf_vars({("openlineage", "dag_state_change_process_pool_size"): max_workers}):
             listener.on_dag_run_running(mock.MagicMock(), None)
-        mock_executor.assert_called_once_with(max_workers=expected, initializer=mock.ANY)
+        mock_executor.assert_called_once_with(max_workers=expected, initializer=mock.ANY, mp_context=mock.ANY)
+        assert mock_executor.call_args.kwargs["mp_context"].get_start_method() == "forkserver"
         mock_executor.return_value.submit.assert_called_once()
 
     @pytest.mark.db_test

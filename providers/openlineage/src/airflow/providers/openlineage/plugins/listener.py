@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
 import sys
 import threading
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from functools import cache
+from multiprocessing.connection import wait
 from typing import TYPE_CHECKING
 
 import psutil
@@ -77,6 +79,26 @@ else:
     from setproctitle import getproctitle, setproctitle
 
 
+def _exit_with_parent():
+    """
+    Exit this pool worker as soon as the process that owns the pool is gone.
+
+    ``before_stopping`` only runs in components that call it (scheduler, task runner). An API server
+    worker that is refreshed, killed on timeout or crashes never shuts its pool down, and an idle pool
+    worker blocked on its call queue never sees EOF because it holds a write end of that pipe itself.
+    Without this watchdog every such worker leaves an orphaned pool worker behind for good.
+    """
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+
+    def _watch():
+        wait([parent.sentinel])
+        os._exit(0)
+
+    threading.Thread(target=_watch, name="openlineage-pool-parent-watchdog", daemon=True).start()
+
+
 def _executor_initializer():
     """
     Initialize processes for the executor used with DAGRun listener's methods (on scheduler).
@@ -90,6 +112,8 @@ def _executor_initializer():
     parent's ``Stats.initialize(...)`` call from scheduler startup does not propagate across the
     spawn boundary.
     """
+    # First, so a worker that later hangs in initialization still exits with its parent.
+    _exit_with_parent()
     log = logging.getLogger(__name__)
     # This initializer is used only on the scheduler
     # We can configure_orm regardless of the Airflow version, as DB access is always allowed from scheduler.
@@ -1122,6 +1146,9 @@ class OpenLineageListener:
             self._executor = ProcessPoolExecutor(
                 max_workers=conf.dag_state_change_process_pool_size(),
                 initializer=_executor_initializer,
+                # Never fork: the pool is also created inside multithreaded API server workers, where a
+                # forked child can inherit a lock held by another thread and hang, dropping its events.
+                mp_context=multiprocessing.get_context("forkserver"),
             )
         return self._executor
 
